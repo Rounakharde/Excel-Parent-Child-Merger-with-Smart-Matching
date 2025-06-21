@@ -1,148 +1,149 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import io
-from fuzzywuzzy import fuzz
-from fuzzywuzzy import process
-import time
-from PIL import Image
+import base64
+from io import BytesIO
 import matplotlib.pyplot as plt
+from fpdf import FPDF
+from difflib import SequenceMatcher
 
 st.set_page_config(layout="wide")
-st.title("📊 Excel Parent-Child Merger with Smart Matching & Multi-Format Export")
+st.title("📁 Excel Parent-Child Merger & Filter Tool")
 
-# Function to find the best matching column name using fuzzy matching
-def find_best_match(col, columns):
-    best_match, score = process.extractOne(col, columns, scorer=fuzz.token_sort_ratio)
-    return best_match if score > 70 else None
+# Function to find best matching column using similarity
+def find_best_match(col1, col2):
+    best_match = None
+    highest_ratio = 0
+    for c1 in col1:
+        for c2 in col2:
+            ratio = SequenceMatcher(None, c1.lower(), c2.lower()).ratio()
+            if ratio > highest_ratio:
+                highest_ratio = ratio
+                best_match = (c1, c2)
+    return best_match if highest_ratio > 0.5 else (None, None)
 
-# Automatically detect correct header row
-def detect_header_row(df, max_rows=5):
-    for i in range(max_rows):
-        if df.iloc[i].isnull().sum() < len(df.columns) * 0.5:
-            df.columns = df.iloc[i]
-            return df[i+1:].reset_index(drop=True)
-    df.columns = [f"Column_{i}" for i in range(df.shape[1])]
-    return df.reset_index(drop=True)
-
-# Optimized search filter function using vectorized operations
-def fast_search(df, term):
-    mask = df.astype(str).apply(lambda x: x.str.contains(term, case=False, na=False))
-    return df[mask.any(axis=1)]
-
-# Export functions
-def download_file(df, file_type, file_name):
-    if file_type == 'CSV':
-        return df.to_csv(index=False).encode('utf-8')
-    elif file_type == 'XLSX':
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False)
-        return output.getvalue()
-    elif file_type == 'PDF':
-        fig, ax = plt.subplots(figsize=(12, len(df)//2 + 1))
-        ax.axis('off')
-        table = ax.table(cellText=df.values, colLabels=df.columns, loc='center')
-        plt.tight_layout()
-        output = io.BytesIO()
-        plt.savefig(output, format='pdf')
-        plt.close(fig)
-        return output.getvalue()
-    elif file_type == 'JPG':
-        fig, ax = plt.subplots(figsize=(12, len(df)//2 + 1))
-        ax.axis('off')
-        table = ax.table(cellText=df.values, colLabels=df.columns, loc='center')
-        plt.tight_layout()
-        output = io.BytesIO()
-        plt.savefig(output, format='jpeg')
-        plt.close(fig)
-        return output.getvalue()
-    else:
-        return None
-
-# Upload Excel file
-uploaded_file = st.file_uploader("Upload Excel File", type=[".xlsx"])
+# File uploader
+uploaded_file = st.file_uploader("Upload Excel file", type=["xlsx", "xls"])
 
 if uploaded_file:
-    try:
-        xl = pd.ExcelFile(uploaded_file)
-        sheet_names = xl.sheet_names
+    xls = pd.ExcelFile(uploaded_file)
+    sheet_names = xls.sheet_names
 
-        parent_df, child_df = None, None
-        if len(sheet_names) >= 2:
-            sheet_dfs = []
-            for name in sheet_names:
-                raw_df = xl.parse(name, header=None)
-                cleaned_df = detect_header_row(raw_df)
-                cleaned_df = cleaned_df.dropna(how='all').dropna(axis=1, how='all')
-                sheet_dfs.append((name, cleaned_df))
+    # Auto-select sheet names
+    if len(sheet_names) >= 2:
+        parent_sheet = sheet_names[0]
+        child_sheet = sheet_names[1]
+    else:
+        st.error("Please upload an Excel file with at least two sheets (Parent and Child).")
+        st.stop()
 
-            sorted_sheets = sorted(sheet_dfs, key=lambda x: len(x[1]), reverse=True)
-            parent_name, parent_df = sorted_sheets[0]
-            child_name, child_df = sorted_sheets[1]
-        else:
-            st.error("At least two sheets required for Parent and Child.")
+    # Read sheets with dynamic header detection
+    def read_with_header_guess(sheet):
+        df_raw = pd.read_excel(uploaded_file, sheet_name=sheet, header=None)
+        header_row_index = df_raw.first_valid_index()
+        for i in range(min(5, len(df_raw))):
+            if df_raw.iloc[i].nunique() == len(df_raw.columns):
+                header_row_index = i
+                break
+        df = pd.read_excel(uploaded_file, sheet_name=sheet, header=header_row_index)
+        return df
 
-        if parent_df is not None and child_df is not None:
-            st.subheader(f"📁 Parent Sheet: {parent_name}")
-            parent_df = parent_df.dropna(how='all').dropna(axis=1, how='all')
-            search_term_parent = st.text_input("Search in Parent Table", key="parent_search")
-            if search_term_parent:
-                parent_filtered = fast_search(parent_df, search_term_parent)
-            else:
-                parent_filtered = parent_df
-            st.dataframe(parent_filtered, use_container_width=True, height=300)
+    parent_df = read_with_header_guess(parent_sheet)
+    child_df = read_with_header_guess(child_sheet)
 
-            st.subheader(f"📁 Child Sheet: {child_name}")
-            child_df = child_df.dropna(how='all').dropna(axis=1, how='all')
-            search_term_child = st.text_input("Search in Child Table", key="child_search")
-            if search_term_child:
-                child_filtered = fast_search(child_df, search_term_child)
-            else:
-                child_filtered = child_df
-            st.dataframe(child_filtered, use_container_width=True, height=300)
+    st.subheader("📊 Parent Table")
+    st.dataframe(parent_df, use_container_width=True)
 
-            # Smart column name matching
-            parent_cols = parent_df.columns.astype(str).tolist()
-            child_cols = child_df.columns.astype(str).tolist()
-            match_found = False
-            for p_col in parent_cols:
-                best_child_col = find_best_match(p_col, child_cols)
-                if best_child_col:
-                    try:
-                        merged_df = pd.merge(parent_df, child_df, left_on=p_col, right_on=best_child_col, how='inner')
-                        match_found = True
-                        match_info = f"Merging on Parent Column: **{p_col}** ↔ Child Column: **{best_child_col}**"
-                        break
-                    except Exception as e:
-                        st.warning(f"Merge attempt failed on {p_col} and {best_child_col}: {e}")
+    st.subheader("📊 Child Table")
+    st.dataframe(child_df, use_container_width=True)
 
-            if match_found:
-                st.subheader("🔗 Merged Result")
-                search_term_merge = st.text_input("Search in Merged Table", key="merged_search")
-                if search_term_merge:
-                    merged_filtered = fast_search(merged_df, search_term_merge)
-                else:
-                    merged_filtered = merged_df
-                st.markdown(match_info)
-                st.dataframe(merged_filtered, use_container_width=True, height=400)
+    # Auto match columns
+    parent_col, child_col = find_best_match(parent_df.columns, child_df.columns)
 
-                st.subheader("📥 Download Merged File")
-                file_type = st.selectbox("Choose Format", ["CSV", "XLSX", "PDF", "JPG"])
-                if st.button("Download"):
-                    content = download_file(merged_filtered, file_type, "Merged_Result")
-                    if content:
-                        mime = {
-                            'CSV': 'text/csv',
-                            'XLSX': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                            'PDF': 'application/pdf',
-                            'JPG': 'image/jpeg'
-                        }[file_type]
-                        st.download_button(f"⬇️ Download as {file_type}", content, file_name=f"Merged_Result.{file_type.lower()}", mime=mime)
-                    else:
-                        st.warning("Unsupported format selected.")
+    if not parent_col or not child_col:
+        st.error("⚠️ No matching columns found for merging. Please check headers.")
+        st.stop()
 
-            else:
-                st.warning("⚠️ No matching column names found for merging. Please check headers.")
+    merged_df = pd.merge(parent_df, child_df, left_on=parent_col, right_on=child_col, how="inner")
 
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
+    # ---------- COLUMN SELECTOR ----------
+    st.subheader("🧩 Column Selector")
+    selected_columns = st.multiselect("Select columns to display", merged_df.columns.tolist(), default=merged_df.columns.tolist())
+    filtered_merged_df = merged_df[selected_columns]
+
+    # ---------- ROW SEARCH ----------
+    st.subheader("🔍 Search Rows")
+    search_text = st.text_input("Enter text to search in all rows")
+    if search_text:
+        filtered_merged_df = filtered_merged_df[filtered_merged_df.apply(lambda row: row.astype(str).str.contains(search_text, case=False).any(), axis=1)]
+
+    # ---------- FILTER UI IN SHORT FORM ----------
+    with st.expander("🔧 Column Filters"):
+        col1, col2, col3, col4 = st.columns(4)
+        filter_column = col1.selectbox("Column", filtered_merged_df.columns)
+        condition = col2.selectbox("Cond", ["=", "!=", ">", "<", ">=", "<="])
+        filter_value = col3.text_input("Value")
+        if col4.button("Filter"):
+            try:
+                val_type = type(filtered_merged_df[filter_column].dropna().iloc[0])
+                val = val_type(filter_value)
+                if condition == "=":
+                    filtered_merged_df = filtered_merged_df[filtered_merged_df[filter_column] == val]
+                elif condition == "!=":
+                    filtered_merged_df = filtered_merged_df[filtered_merged_df[filter_column] != val]
+                elif condition == ">":
+                    filtered_merged_df = filtered_merged_df[filtered_merged_df[filter_column] > val]
+                elif condition == "<":
+                    filtered_merged_df = filtered_merged_df[filtered_merged_df[filter_column] < val]
+                elif condition == ">=":
+                    filtered_merged_df = filtered_merged_df[filtered_merged_df[filter_column] >= val]
+                elif condition == "<=":
+                    filtered_merged_df = filtered_merged_df[filtered_merged_df[filter_column] <= val]
+            except Exception as e:
+                st.warning(f"Filter error: {e}")
+
+    st.subheader("🔗 Merged Table")
+    st.dataframe(filtered_merged_df, use_container_width=True)
+
+    st.subheader("📥 Download Merged File")
+
+    def convert_df_to_csv(df):
+        return df.to_csv(index=False).encode("utf-8")
+
+    def convert_df_to_excel(df):
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False, sheet_name="Merged")
+        return output.getvalue()
+
+    def convert_df_to_pdf(df):
+        pdf = FPDF(orientation='L', unit='mm', format='A4')
+        pdf.add_page()
+        pdf.set_font("Arial", size=10)
+        pdf.set_auto_page_break(auto=True, margin=10)
+        col_width = pdf.w / (len(df.columns) + 1)
+        row_height = 8
+        for col in df.columns:
+            pdf.cell(col_width, row_height * 1.25, str(col), border=1)
+        pdf.ln(row_height * 1.25)
+        for i in range(len(df)):
+            for col in df.columns:
+                value = str(df.iloc[i][col])
+                pdf.cell(col_width, row_height, value[:30], border=1)
+            pdf.ln(row_height)
+        return pdf.output(dest='S').encode('latin-1')
+
+    colA, colB, colC = st.columns(3)
+
+    with colA:
+        csv = convert_df_to_csv(filtered_merged_df)
+        st.download_button("⬇️ Download CSV", csv, file_name="merged.csv", mime="text/csv")
+
+    with colB:
+        excel = convert_df_to_excel(filtered_merged_df)
+        st.download_button("⬇️ Download XLSX", excel, file_name="merged.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    with colC:
+        pdf_bytes = convert_df_to_pdf(filtered_merged_df)
+        st.download_button("⬇️ Download PDF", pdf_bytes, file_name="merged.pdf", mime="application/pdf")
