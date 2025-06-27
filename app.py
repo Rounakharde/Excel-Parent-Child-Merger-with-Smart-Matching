@@ -117,22 +117,48 @@ if uploaded_file:
             df.to_excel(writer, index=False, sheet_name="Merged")
         return output.getvalue()
 
+
     def convert_df_to_pdf(df):
-        pdf = FPDF(orientation='L', unit='mm', format='A4')
+        pdf = FPDF(orientation='L', unit='mm', format='A3')  # A3 for more space
         pdf.add_page()
-        pdf.set_font("Arial", size=10)
-        pdf.set_auto_page_break(auto=True, margin=10)
-        col_width = pdf.w / (len(df.columns) + 1)
-        row_height = 8
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.set_font("Arial", size=8)
+
+        max_col_width = 60  # maximum width per column
+        min_col_width = 20  # minimum width per column
+        page_width = pdf.w - 20  # available width after margin
+
+        col_widths = []
+        total_content_width = 0
         for col in df.columns:
-            pdf.cell(col_width, row_height * 1.25, str(col), border=1)
+            longest_item = max([len(str(x)) for x in df[col].dropna().astype(str)] + [len(col)])
+            width = min(max(longest_item * 2, min_col_width), max_col_width)
+            col_widths.append(width)
+            total_content_width += width
+
+        if total_content_width > page_width:
+            scale_factor = page_width / total_content_width
+            col_widths = [w * scale_factor for w in col_widths]
+
+        row_height = 6
+
+        # Add header
+        for i, col in enumerate(df.columns):
+            pdf.cell(col_widths[i], row_height * 1.25, txt=str(col), border=1)
         pdf.ln(row_height * 1.25)
-        for i in range(len(df)):
-            for col in df.columns:
-                value = str(df.iloc[i][col])
-                pdf.cell(col_width, row_height, value[:30], border=1)
-            pdf.ln(row_height)
+
+        # Add rows
+        for _, row in df.iterrows():
+            for i, item in enumerate(row):
+                txt = str(item)
+                max_chars = int(col_widths[i] // 2.2)
+                if len(txt) > max_chars:
+                    txt = txt[:max_chars - 3] + "..."
+                pdf.cell(col_widths[i], row_height * 1.25, txt=txt, border=1)
+            pdf.ln(row_height * 1.25)
+
         return pdf.output(dest='S').encode('latin-1')
+
 
     colA, colB, colC = st.columns(3)
 
